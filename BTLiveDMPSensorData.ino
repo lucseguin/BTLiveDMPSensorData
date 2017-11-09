@@ -18,17 +18,25 @@
 #include <Adafruit_SSD1306.h>
 #include <helper_3dmath.h>
 
+#include "FastRunningMedian.hpp"
+#include "EMAFilter.hpp"
+#include "SGAFilter.hpp"
+
 ////////////////////////////////////////////////////////////////////////////////
 //// Parameters
 ////////////////////////////////////////////////////////////////////////////////
 #define OFFSETS_FILE "offsets.txt"
-//#define READINGS_FILE "data.txt"
-//#define MAX_TIME_RECORDING 80.00
+#define READINGS_FILE "data.txt"
+#define MAX_TIME_RECORDING 70.00
 #define DEBUGGING 1
 #define DMP_STABILIZATION_TIME 30.00
-#define CUTOFF_DMP_LSB_VALUE 25.0 
-#define EMA_ALPHA 0.9
+#define CUTOFF_DMP_LSB_VALUE 25
+#define EMA_ALPHA_ACCEL 0.9
+#define EMA_ALPHA_GRAVITY 0.9
 #define SEND_LIVE_DATA_OVER_BT 1
+
+//#define SGA_FILTER 1
+#define EMA_FILTER 1
 
 #define OLED_MOSI   9
 #define OLED_CLK   10
@@ -56,7 +64,7 @@ VectorInt16 gyro;       // [x, y, z]          gyro
 VectorInt16 aa;         // [x, y, z]            accel sensor measurements
 VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
 VectorInt16 aaWorld;    // [x, y, z]            world-frame accel sensor measurements
-VectorInt16 linearAccel;    // [x, y, z]            
+VectorInt16 laccel;    // [x, y, z]              
 VectorFloat gravity;    // [x, y, z]            gravity vector
 float mx, my, mz;
 int16_t ax, ay, az, gx, gy, gz;
@@ -67,16 +75,7 @@ bool deviceConnected = false;
 #define ble Serial3
 bool only_displacement = true; 
 bool post_dmp_stab_complete = false; 
-#define CODE_OPTION1 1
-//#define CODE_OPTION2 2
-//#define CODE_OPTION3 3
 
-float axFilt = 0.0;
-float ayFilt = 0.0;
-float dirFilt = 0.0;
-float dirAlpha = 0.05;
-float flagX = 0.0;
-float flagY = 0.0;
 
 float directionX = 0;
 float directionY = 0;
@@ -111,6 +110,21 @@ VectorFloat previous_position;
 VectorFloat current_position;
 
 char convert_buffer[16];
+
+////////////////////////////////////////////////////////////////////////////////
+////////// Filters
+////////////////////////////////////////////////////////////////////////////////
+
+SGAFilter * sgafiltX;
+SGAFilter * sgafiltY;
+
+EMAFilter<int16_t> * emafiltX;
+EMAFilter<int16_t> * emafiltY;
+EMAFilter<int16_t> * emafiltDir;
+
+FastRunningMedian<int16_t,3, 0> * medfiltX;
+FastRunningMedian<int16_t,3, 0> * medfiltY;
+
 ////////////////////////////////////////////////////////////////////////////////
 ////////// Bluetooth LE
 ////////////////////////////////////////////////////////////////////////////////
@@ -222,6 +236,7 @@ void setup() {
     Serial.println("OFFSETS_FILE not found!");
     while (1) {}
   }
+  
 
 #ifdef READINGS_FILE
   //write readings to file for test in Matlab
@@ -300,14 +315,17 @@ void setup() {
   previous_position.x = 0.0;
   previous_position.y = 0.0;
 
-#ifdef CODE_OPTION1
-  Serial.println(F("Using Code Option1"));
-#elif CODE_OPTION2
-  Serial.println(F("Using Code Option 2"));
-#elif CODE_OPTION3
-  Serial.println(F("Using Code Option 3"));  
-#endif
+  sgafiltX = new SGAFilter(3,5);
+  sgafiltY = new SGAFilter(3,5);
+  
+  emafiltX = new EMAFilter<int16_t>(0.9);
+  emafiltY = new EMAFilter<int16_t>(0.9);
+  emafiltDir= new EMAFilter<int16_t>(0.05);
+  
+  medfiltX = new FastRunningMedian<int16_t,3, 0>();
+  medfiltY = new FastRunningMedian<int16_t,3, 0>();
 
+  
   t_last = t_print = t_start = millis();
   Serial.print("Start time ");
   Serial.println(t_start);
@@ -418,9 +436,7 @@ void loop() {
     // Convert radians to degrees for readability.
     float headingDegrees = heading * 180 / M_PI;
 
-    //Exponential Moving Average
-    dirFilt = (1 - dirAlpha)*dirFilt + dirAlpha*headingDegrees;
-    headingDegrees = dirFilt;
+    headingDegrees = emafiltDir->filter(headingDegrees);
 
     ////////////////////////////////////////////////////////////////////////////////
     // get linear acceleration, adjusted to remove gravity
@@ -431,15 +447,20 @@ void loop() {
     mpu.dmpGetGravity(&gravity, &q);
     mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
     mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q);
-    linearAccel = aaReal;
     
+    //Use median filter to remove outliers
+    laccel.x = medfiltX->filter(aaReal.x);
+    laccel.y = medfiltY->filter(aaReal.y);
+//              
     //if value is in interval [-CUTOFF_DMP_LSB_VALUE, CUTOFF_DMP_LSB_VALUE] set to zero
-    if (linearAccel.x >= -CUTOFF_DMP_LSB_VALUE && linearAccel.x <= CUTOFF_DMP_LSB_VALUE) {
-      linearAccel.x = 0;
+    if (laccel.x >= -CUTOFF_DMP_LSB_VALUE && laccel.x <= CUTOFF_DMP_LSB_VALUE) {
+      laccel.x = 0;
+    } 
+
+    if (laccel.y >= -CUTOFF_DMP_LSB_VALUE && laccel.y <= CUTOFF_DMP_LSB_VALUE) {
+      laccel.y = 0;
     }
-    if (linearAccel.y >= -CUTOFF_DMP_LSB_VALUE && linearAccel.y <= CUTOFF_DMP_LSB_VALUE) {
-      linearAccel.y = 0;
-    }
+
 //
 //#ifdef DEBUGGING   
 //    //print readings to serial console for debugging
@@ -467,10 +488,10 @@ void loop() {
               readings_file.print("accel:"); readings_file.print(aa.x); readings_file.print(","); readings_file.print(aa.y); readings_file.print(","); readings_file.println(aa.z);
               readings_file.print("laccel:"); readings_file.print(aaReal.x); readings_file.print(","); readings_file.print(aaReal.y); readings_file.print(","); readings_file.println(aaReal.z);
               readings_file.print("laccelw:"); readings_file.print(aaWorld.x); readings_file.print(","); readings_file.print(aaWorld.y); readings_file.print(","); readings_file.println(aaWorld.z);
-              readings_file.print("g:"); readings_file.print(gravity.x); readings_file.print(","); readings_file.print(gravity.y); readings_file.print(","); readings_file.println(gravity.z);
+              readings_file.print("g:"); readings_file.print(gravity.x, 6); readings_file.print(","); readings_file.print(gravity.y, 6); readings_file.print(","); readings_file.println(gravity.z, 6);
               readings_file.print("gyro:"); readings_file.print(gyro.x); readings_file.print(","); readings_file.print(gyro.y); readings_file.print(","); readings_file.println(gyro.z);
               readings_file.print("mag:"); readings_file.print(mx); readings_file.print(","); readings_file.print(my); readings_file.print(","); readings_file.println(mz);
-              readings_file.print("q:"); readings_file.print(q.w); readings_file.print(","); readings_file.print(q.x); readings_file.print(","); readings_file.print(q.y);readings_file.print(","); readings_file.println(q.z);
+              readings_file.print("q:"); readings_file.print(q.w, 6); readings_file.print(","); readings_file.print(q.x, 6); readings_file.print(","); readings_file.print(q.y, 6);readings_file.print(","); readings_file.println(q.z, 6);
               readings_file.print("heading:"); readings_file.println(headingDegrees); 
               readings_file.println("speed:0.0000,0.0000");
               readings_file.println("position:0.0000,0.0000"); 
@@ -493,17 +514,20 @@ void loop() {
 
       }
 
-      //convert from LSB/g to m/s2
-      current_acceleration.x = linearAccel.x / 8192.0 * 9.81;
-      current_acceleration.y = linearAccel.y / 8192.0 * 9.81;
-      
-      //Exponential Moving Average
-      axFilt = (1 - EMA_ALPHA)*axFilt + EMA_ALPHA*current_acceleration.x;
-      ayFilt = (1 - EMA_ALPHA)*ayFilt + EMA_ALPHA*current_acceleration.y;
-      
-      current_acceleration.x = axFilt;
-      current_acceleration.y  = ayFilt;
+#ifdef EMA_FILTER            
+      laccel.x = emafiltX->filter(laccel.x);
+      laccel.y  = emafiltY->filter(laccel.y);
+#endif
+#ifdef SGA_FILTER
+      //Savitzky Golay Filter
+//      laccelw.x = sgafiltX->filter(laccelw.x);
+//      laccelw.y = sgafiltY->filter(laccelw.y);
+#endif
 
+      //convert from LSB/g to m/s2
+      current_acceleration.x = laccel.x / 8192.0 * 9.81;
+      current_acceleration.y = laccel.y / 8192.0 * 9.81;
+      
       if (current_acceleration.x < 0.0001 && current_acceleration.x > -0.0001) {
         current_acceleration.x = 0.0;
         current_velocity.x = 0.0;
@@ -529,22 +553,22 @@ void loop() {
       else
         current_position.y = previous_position.y + dt * current_velocity.y;
 
+
       #ifdef READINGS_FILE
           //write readings for 
           readings_file.print("dt:"); readings_file.println(dt, 4);;
           readings_file.print("accel:"); readings_file.print(aa.x); readings_file.print(","); readings_file.print(aa.y); readings_file.print(","); readings_file.println(aa.z);
           readings_file.print("laccel:"); readings_file.print(aaReal.x); readings_file.print(","); readings_file.print(aaReal.y); readings_file.print(","); readings_file.println(aaReal.z);
           readings_file.print("laccelw:"); readings_file.print(aaWorld.x); readings_file.print(","); readings_file.print(aaWorld.y); readings_file.print(","); readings_file.println(aaWorld.z);
-          readings_file.print("g:"); readings_file.print(gravity.x); readings_file.print(","); readings_file.print(gravity.y); readings_file.print(","); readings_file.println(gravity.z);
+          readings_file.print("g:"); readings_file.print(gravity.x, 6); readings_file.print(","); readings_file.print(gravity.y, 6); readings_file.print(","); readings_file.println(gravity.z, 6);
           readings_file.print("gyro:"); readings_file.print(gyro.x); readings_file.print(","); readings_file.print(gyro.y); readings_file.print(","); readings_file.println(gyro.z);
           readings_file.print("mag:"); readings_file.print(mx); readings_file.print(","); readings_file.print(my); readings_file.print(","); readings_file.println(mz);
-          readings_file.print("q:"); readings_file.print(q.w); readings_file.print(","); readings_file.print(q.x); readings_file.print(","); readings_file.print(q.y);readings_file.print(","); readings_file.println(q.z);
+          readings_file.print("q:"); readings_file.print(q.w, 6); readings_file.print(","); readings_file.print(q.x, 6); readings_file.print(","); readings_file.print(q.y, 6);readings_file.print(","); readings_file.println(q.z, 6);
           readings_file.print("heading:"); readings_file.println(headingDegrees); 
           readings_file.print("speed:"); readings_file.print(current_velocity.x); readings_file.print(","); readings_file.println(current_velocity.y); 
           readings_file.print("position:"); readings_file.print(current_position.x); readings_file.print(","); readings_file.println(current_position.y); 
           readings_file.print("TotalTime:"); readings_file.println(totalTime, 4);
       #endif
-
      if(deviceConnected) {
         #ifdef SEND_LIVE_DATA_OVER_BT
         sprintf(BLE_cmd_buffer, "upd:%d,", (int)headingDegrees);
@@ -566,9 +590,9 @@ void loop() {
       
       display.clearDisplay();
       display.setCursor(0, 9);
-      display.print("vX:");display.print(current_velocity.x);
+      display.print("vX:");display.print(current_velocity.x, 4);
       display.setCursor(0, 18);
-      display.print("vY:");display.println(current_velocity.y); 
+      display.print("vY:");display.println(current_velocity.y, 4); 
       display.display();
 
       previous_velocity = current_velocity;
@@ -619,6 +643,7 @@ boolean BLECmd(long timeout, char* command, char* temp) {
 // #endif 
  
   ble.print(command);
+  ble.flush();
 
   // The loop below wait till either a response is received or timeout
   // The problem with this BLE Shield is the HM-10 module does not response with CR LF at the end of the response,
