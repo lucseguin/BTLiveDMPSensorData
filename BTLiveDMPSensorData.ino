@@ -30,7 +30,7 @@
 #define MAX_TIME_RECORDING 70.00
 #define DEBUGGING 1
 #define DMP_STABILIZATION_TIME 30.00
-#define CUTOFF_DMP_LSB_VALUE 25
+#define CUTOFF_DMP_LSB_VALUE 17
 #define EMA_ALPHA_ACCEL 0.9
 #define EMA_ALPHA_GRAVITY 0.9
 #define SEND_LIVE_DATA_OVER_BT 1
@@ -122,8 +122,8 @@ EMAFilter<int16_t> * emafiltX;
 EMAFilter<int16_t> * emafiltY;
 EMAFilter<int16_t> * emafiltDir;
 
-FastRunningMedian<int16_t,3, 0> * medfiltX;
-FastRunningMedian<int16_t,3, 0> * medfiltY;
+FastRunningMedian<int16_t,5, 0> * medfiltX;
+FastRunningMedian<int16_t,5, 0> * medfiltY;
 
 ////////////////////////////////////////////////////////////////////////////////
 ////////// Bluetooth LE
@@ -322,8 +322,8 @@ void setup() {
   emafiltY = new EMAFilter<int16_t>(0.9);
   emafiltDir= new EMAFilter<int16_t>(0.05);
   
-  medfiltX = new FastRunningMedian<int16_t,3, 0>();
-  medfiltY = new FastRunningMedian<int16_t,3, 0>();
+  medfiltX = new FastRunningMedian<int16_t,5, 0>();
+  medfiltY = new FastRunningMedian<int16_t,5, 0>();
 
   
   t_last = t_print = t_start = millis();
@@ -389,12 +389,12 @@ void loop() {
   // reset interrupt flag and get INT_STATUS byte
   mpuInterrupt = false;
   mpuIntStatus = mpu.getIntStatus();
-
+  
   // get current FIFO count
   fifoCount = mpu.getFIFOCount();
 
   // check for overflow (this should never happen unless our code is too inefficient)
-  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+  if ((mpuIntStatus & 0x10)|| fifoCount == 1024) {
     // reset so we can continue cleanly
     mpu.resetFIFO();
     Serial.println(F("FIFO overflow!"));
@@ -447,7 +447,7 @@ void loop() {
     mpu.dmpGetGravity(&gravity, &q);
     mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
     mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q);
-    
+
     //Use median filter to remove outliers
     laccel.x = medfiltX->filter(aaReal.x);
     laccel.y = medfiltY->filter(aaReal.y);
@@ -460,7 +460,7 @@ void loop() {
     if (laccel.y >= -CUTOFF_DMP_LSB_VALUE && laccel.y <= CUTOFF_DMP_LSB_VALUE) {
       laccel.y = 0;
     }
-
+    
 //
 //#ifdef DEBUGGING   
 //    //print readings to serial console for debugging
@@ -498,7 +498,7 @@ void loop() {
               readings_file.print("TotalTime:"); readings_file.println(totalTime, 4);
           #endif
        
-    } else {
+    } else {    
       if (post_dmp_stab_complete == false) {
         post_dmp_stab_complete = true;
         Serial.println(F("DMP Stabilized!"));
@@ -508,7 +508,7 @@ void loop() {
           Serial.println(F("Sending Post Stabilization Init String!"));
           #ifdef SEND_LIVE_DATA_OVER_BT
           sprintf(BLE_cmd_buffer, "init:%d;", referenceHeadingDegrees);
-          BLECmd(BLE_timeout, BLE_cmd_buffer, BLE_buffer);
+          BLECmd(0, BLE_cmd_buffer, BLE_buffer);
           #endif
         }
 
